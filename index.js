@@ -281,10 +281,25 @@ function addDisassemblyError(list, error) {
 }
 
 /*
+    Given an opcode index, returns the current code block by iterating backwards
+    until a JUMPDEST is found
+*/
+function getCurrentCodeBlock(opcodes, opcodeIndex) {
+    for (let i = opcodeIndex; i >= 0; i--) {
+        const opcode = opcodes[i];
+        if (!opcode) break;
+
+        if (opcode.opcode === "JUMPDEST") {
+            return i;
+        }
+    }
+
+    return null;
+}
+
+/*
     TODO:
-        - detect jumps, indirect jumps etc
-        - add addr labels
-        - detect inputs / ouputs
+        - detect inputs / ouputs (for each code block, we can infer external inputs from the opcodes used)
         - detect program start
         - detect common structures such as function selector
 */
@@ -292,6 +307,7 @@ function disassemble(byteString) {
     const bytes = byteStringToBytes(byteString);
     const opcodes = [];
     const disassemblyErrors = [];
+    const metadata = {};
 
     // Opcodes are indexed by the opcode index
     // Add a lookup table to index them by address
@@ -335,8 +351,8 @@ function disassemble(byteString) {
     }
 
     // Add jump labels
-    const labels = [];
-    labels.push({ name: "entry", addr: 0 });
+    const labels = {};
+    labels[0] = { name: "entry", addr: 0 };
 
     // We detect locations by looking at where JUMP & JUMPI instructions JUMP TO
     // We can combine this with a JUMPDEST analysis
@@ -363,6 +379,8 @@ function disassemble(byteString) {
                     ...c_disassemblyErrors.INVALID_JUMPDEST,
                     data: { dest: null, addr: previousOpcode.operandValue },
                 });
+
+                metadata.hasInvalidJumpDest = true;
             } else if (destinationOpcode.opcode !== "JUMPDEST") {
                 addDisassemblyError(disassemblyErrors, {
                     code: "INVALID_JUMPDEST",
@@ -372,9 +390,14 @@ function disassemble(byteString) {
                         addr: previousOpcode.operandValue,
                     },
                 });
+
+                metadata.hasInvalidJumpDest = true;
             } else {
                 const name = `loc_${previousOpcode.operandValue.toString(16)}`;
-                labels.push({ name, addr: previousOpcode.operandValue });
+                labels[previousOpcode.operandValue] = {
+                    name,
+                    addr: previousOpcode.operandValue,
+                };
             }
         }
     }
@@ -404,7 +427,41 @@ function disassemble(byteString) {
             };
 
             functions.push(func);
+
+            // When a function selector is found, we can mark the begining of the code block
+            // containing it
+            if (!metadata.hasFunctionSelector) {
+                const functionSelectorStart = getCurrentCodeBlock(opcodes, i);
+                const jumpdestOpcode = opcodes[functionSelectorStart];
+
+                if (labels[jumpdestOpcode.addr]) {
+                    labels[jumpdestOpcode.addr].name = "function_selector";
+                    metadata.hasFunctionSelector = true;
+                }
+            }
         }
+    }
+
+    // Detect free memory pointers
+    // This is useful to detect where is the start of the constructor
+    // And where is the start of the contract deployed on chain
+    const freeMemoryPointers = [];
+    for (let i = 0; i < opcodes.length; i++) {
+        const ops = [opcodes[i], opcodes[i + 1], opcodes[i + 2]];
+        for (const op of ops) if (!op) break;
+
+        if (
+            ops[0].opcode === "PUSH1" &&
+            ops[0].operandValue === 0x80 &&
+            ops[1].opcode === "PUSH1" &&
+            ops[1].operandValue === 0x40
+        ) {
+            freeMemoryPointers.push(ops[0].addr);
+        }
+    }
+
+    if (freeMemoryPointers.length > 1) {
+        metadata.seemsToHaveConstructorCode = true;
     }
 
     return {
@@ -416,19 +473,13 @@ function disassemble(byteString) {
 }
 
 function print(disassemblyOutput) {
-    // Index labels by address
-    const labelsByAddr = {};
-    for (const label of disassemblyOutput.labels) {
-        labelsByAddr[label.addr] = label;
-    }
-
     const functionsByAddr = {};
     for (const func of disassemblyOutput.functions) {
         functionsByAddr[func.addr] = func;
     }
 
     for (const e of disassemblyOutput.opcodes) {
-        const label = labelsByAddr[e.addr];
+        const label = disassemblyOutput.labels[e.addr];
         const func = functionsByAddr[e.addr];
 
         if (func) {
