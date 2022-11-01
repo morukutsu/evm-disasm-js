@@ -335,7 +335,7 @@ function disassemble(byteString) {
         // Except "PUSH" instructions which have another variable size constant
         let operandValue;
         if (opcode && opcode.startsWith("PUSH"))
-            operandValue = Number.parseInt(operandString, 16);
+            operandValue = BigInt(operandString); // TODO: needs bignum support
 
         const opcodeIndex = opcodes.length;
 
@@ -352,6 +352,8 @@ function disassemble(byteString) {
 
     // Add jump labels
     const labels = {};
+    const jumps = [];
+
     labels[0] = { name: "entry", addr: 0 };
 
     // We detect locations by looking at where JUMP & JUMPI instructions JUMP TO
@@ -397,7 +399,13 @@ function disassemble(byteString) {
                 labels[previousOpcode.operandValue] = {
                     name,
                     addr: previousOpcode.operandValue,
+                    from: opcode.addr,
                 };
+
+                jumps.push({
+                    addr: previousOpcode.operandValue,
+                    from: opcode.addr,
+                });
             }
         }
     }
@@ -452,9 +460,9 @@ function disassemble(byteString) {
 
         if (
             ops[0].opcode === "PUSH1" &&
-            ops[0].operandValue === 0x80 &&
+            ops[0].operandValue == 0x80 &&
             ops[1].opcode === "PUSH1" &&
-            ops[1].operandValue === 0x40
+            ops[1].operandValue == 0x40
         ) {
             freeMemoryPointers.push(ops[0].addr);
         }
@@ -467,12 +475,15 @@ function disassemble(byteString) {
     return {
         opcodes,
         labels,
+        jumps,
         functions,
         errors: disassemblyErrors,
     };
 }
 
 function print(disassemblyOutput) {
+    const strings = [];
+
     const functionsByAddr = {};
     for (const func of disassemblyOutput.functions) {
         functionsByAddr[func.addr] = func;
@@ -484,10 +495,13 @@ function print(disassemblyOutput) {
 
         if (func) {
             console.log(`\n${func.name}:`);
+            strings.push(`\n${func.name}:\n`);
         } else if (label) {
             console.log(`\n${label.name}:`);
+            strings.push(`\n${label.name}:\n`);
         }
         console.log("    " + e.readableOutput);
+        strings.push("    " + e.readableOutput + "\n");
     }
 
     // Print errors
@@ -495,6 +509,8 @@ function print(disassemblyOutput) {
         const prefix = error.severity === DISASM_WARNING ? "Warning" : "x";
         console.log(`[${prefix}] ${error.print()}`);
     }
+
+    return strings;
 }
 
 module.exports = { disassemble, print };
