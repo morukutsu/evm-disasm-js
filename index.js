@@ -1,8 +1,8 @@
 /*
     evm-disasm-js
-    - the goal is to write a fast disasembler with little to no dependencies
-    - and decorate the code with helpers for common EVM bytecode structures (code analysis)
-    - in the future, a decompiler could be provided as well
+    - the goal is to write a fast disassembler with little/no dependencies
+    - and decorate the code with helpers for common EVM bytecode structures
+    - in the future, a decompiler could be included as well
 */
 
 const { byteToHex } = require("./lib/string");
@@ -49,8 +49,6 @@ function getCurrentCodeBlock(opcodes, opcodeIndex) {
 /*
     TODO:
         - detect inputs / ouputs (for each code block, we can infer external inputs from the opcodes used)
-        - detect program start
-        - detect common structures such as function selector
 */
 function disassemble(byteString) {
     if (typeof byteString !== "string")
@@ -77,8 +75,11 @@ function disassemble(byteString) {
             throw new Error(`No instruction ${bytecode.toString(16)}`);
 
         const [opcode, advance, fmt] = instructionData;
+        let operandString = fmt ? fmt(bytes, i) : "";
 
-        const operandString = fmt ? fmt(bytes, i) : "";
+        // TODO: Fix for when fmt() reaches the end of the disassembly, find a better fix
+        if (operandString == "0x") operandString = "";
+
         const addr = i;
 
         i += advance;
@@ -91,7 +92,7 @@ function disassemble(byteString) {
         // Except "PUSH" instructions which have another variable size constant
         let operandValue;
         if (opcode && opcode.startsWith("PUSH"))
-            operandValue = BigInt(operandString); // TODO: needs bignum support
+            operandValue = BigInt(operandString);
 
         const opcodeIndex = opcodes.length;
 
@@ -109,6 +110,7 @@ function disassemble(byteString) {
     // Add jump labels
     const labels = {};
     const jumps = [];
+    const jumpsByAddr = {};
 
     labels[0] = { name: "entry", addr: 0 };
 
@@ -120,7 +122,8 @@ function disassemble(byteString) {
 
         if (
             previousOpcode &&
-            previousOpcode.opcode === "PUSH2" &&
+            (previousOpcode.opcode === "PUSH1" ||
+                previousOpcode.opcode === "PUSH2") &&
             (opcode.opcode === "JUMPI" || opcode.opcode === "JUMP")
         ) {
             // Read the instruction at the jump location and make sure there is a JUMPDEST
@@ -135,7 +138,10 @@ function disassemble(byteString) {
                 addDisassemblyError(disassemblyErrors, {
                     code: "INVALID_JUMPDEST",
                     ...c_disassemblyErrors.INVALID_JUMPDEST,
-                    data: { dest: null, addr: previousOpcode.operandValue },
+                    data: {
+                        dest: null,
+                        addr: parseInt(previousOpcode.operandValue),
+                    },
                 });
 
                 metadata.hasInvalidJumpDest = true;
@@ -144,8 +150,8 @@ function disassemble(byteString) {
                     code: "INVALID_JUMPDEST",
                     ...c_disassemblyErrors.INVALID_JUMPDEST,
                     data: {
-                        dest: destinationOpcode,
-                        addr: previousOpcode.operandValue,
+                        dest: destinationOpcode.addr,
+                        addr: parseInt(previousOpcode.operandValue),
                     },
                 });
 
@@ -154,16 +160,20 @@ function disassemble(byteString) {
                 const name = `loc_${previousOpcode.operandValue.toString(16)}`;
                 labels[previousOpcode.operandValue] = {
                     name,
-                    addr: previousOpcode.operandValue,
+                    addr: parseInt(previousOpcode.operandValue),
                     from: opcode.addr,
                 };
 
                 jumps.push({
-                    addr: previousOpcode.operandValue,
+                    addr: parseInt(previousOpcode.operandValue),
                     from: opcode.addr,
                 });
             }
         }
+    }
+
+    for (const jump of jumps) {
+        jumpsByAddr[jump.addr] = jump;
     }
 
     // Add all the other unlabelled JUMPDEST
@@ -200,8 +210,8 @@ function disassemble(byteString) {
             afterNext.opcode === "PUSH2"
         ) {
             const func = {
-                hash: opcode.operandValue,
-                addr: afterNext.operandValue,
+                hash: parseInt(opcode.operandValue),
+                addr: parseInt(afterNext.operandValue),
                 name: `func_${opcode.operandValue.toString(16)}`,
             };
 
@@ -243,12 +253,94 @@ function disassemble(byteString) {
         metadata.seemsToHaveConstructorCode = true;
     }
 
+    // Detect code sections
+    // This algorithm is based on detecting free memory pointers and assuming
+    // the first one is the deployment code and the second one the deployed contract code
+    // By analyzing the code more deeply, we can be more precise on this analysis
+    // Especially on manually written contracts or compiled differently
+    // TODO:
+    //  - detect CODECOPY + RETURN: it is a good hint that there is deployment code
+    const codeSections = [];
+    if (freeMemoryPointers.length === 2) {
+        codeSections.push({
+            start: freeMemoryPointers[0],
+            end: freeMemoryPointers[1] - 1,
+            name: "deploy",
+        });
+
+        codeSections.push({
+            start: freeMemoryPointers[1],
+            end: opcodes[opcodes.length - 1].addr,
+            name: "deployed",
+        });
+    } else {
+        codeSections.push({
+            start: 0,
+            end: opcodes[opcodes.length - 1].addr,
+            name: "deployed",
+        });
+    }
+
     return {
         opcodes,
         labels,
         jumps,
         functions,
         errors: disassemblyErrors,
+        codeSections,
+        cache: {
+            // optimization structures to access the disassembly content faster
+            opcodesByAddr,
+            jumpsByAddr,
+        },
+    };
+}
+
+function serialize(disassembly) {
+    const opcodes = disassembly.opcodes.map((e) => ({
+        ...e,
+        operandValue:
+            e.operandValue !== undefined && e.operandValue !== null
+                ? e.operandValue.toString()
+                : null,
+    }));
+
+    const errors = disassembly.errors.map((e) => ({
+        ...e,
+        print: undefined,
+    }));
+
+    return {
+        opcodes,
+        labels: disassembly.labels,
+        jumps: disassembly.jumps,
+        functions: disassembly.functions,
+        errors,
+        codeSections: disassembly.codeSections,
+    };
+}
+
+function unserialize(serialized) {
+    const opcodes = serialized.opcodes.map((e) => ({
+        ...e,
+        operandValue:
+            e.operandValue !== undefined && e.operandValue !== null
+                ? BigInt(e.operandValue)
+                : null,
+    }));
+
+    const errors = [];
+    for (const e of serialized.errors) {
+        addDisassemblyError(errors, e);
+    }
+
+    return {
+        opcodes,
+        labels: serialized.labels,
+        jumps: serialized.jumps,
+        functions: serialized.functions,
+        errors,
+        codeSections: serialized.codeSections,
     };
 }
 
@@ -284,20 +376,10 @@ function print(disassemblyOutput) {
     return strings;
 }
 
-module.exports = { disassemble, print };
-
-/*
-var o = "";
-
-for (const e of elements) {
-    const c = e.childNodes;
-    const hex = "0x" + c[0].childNodes[0].getAttribute("id");
-    let name = c[0].childNodes[0].getAttribute("name");
-    let out;
-    if (name) out = `t[${hex}] = ["${name}", 1, null];`;
-    else out = `t[${hex}] = [null, 1, null];`;
-
-    o += out;
-}
-
-*/
+module.exports = {
+    disassemble,
+    print,
+    serialize,
+    unserialize,
+    opcodesTable: c_evmOpcodesTable,
+};
