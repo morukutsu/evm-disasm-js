@@ -167,6 +167,7 @@ function disassemble(byteString) {
                 jumps.push({
                     addr: parseInt(previousOpcode.operandValue),
                     from: opcode.addr,
+                    direct: opcode.opcode === "JUMP",
                 });
             }
         }
